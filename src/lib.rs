@@ -5,7 +5,9 @@
 //! ([`timing`]). With the feature `embassy-rp-0-10` the crate adds [`OneWire`], a half-duplex
 //! 8N1 serial line on one selected pin of up to four consecutive pins, built from the PIO block's
 //! `Common`, one `StateMachine` and the pins, all taken by value and handed back by
-//! [`OneWire::release`].
+//! [`OneWire::release`]. It also adds [`UartRx`], a receive-only 8N1 line on any one pin that
+//! borrows the block's `Common` only to build and release, so other state machines of the block
+//! are left alone.
 //!
 //! Examples: see README.md, whose examples are compiled by `cargo test`.
 #![no_std]
@@ -32,9 +34,16 @@ extern crate std;
 #[cfg(feature = "embassy-rp-0-10")]
 mod one_wire;
 pub mod timing;
+#[cfg(feature = "embassy-rp-0-10")]
+mod uart_rx;
 
 #[cfg(feature = "embassy-rp-0-10")]
 pub use one_wire::{BuildError, Config, Error, NewError, OneWire, Parts, Stats};
+#[cfg(feature = "embassy-rp-0-10")]
+pub use uart_rx::{
+    BuildError as UartRxBuildError, Error as UartRxError, NewError as UartRxNewError,
+    Parts as UartRxParts, Stats as UartRxStats, UartRx,
+};
 
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]

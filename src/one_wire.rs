@@ -55,7 +55,7 @@ use fixed::types::U24F8;
 
 use crate::timing::{self, Divider, MAX_LINES, RxWord};
 
-/// What to build a `OneWire` with. Build it with [`Config::new`] and the `with_...` setters.
+/// What to build a `OneWire` or a `UartRx` with. Build it with [`Config::new`] and the `with_...` setters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]

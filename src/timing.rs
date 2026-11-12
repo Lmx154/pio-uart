@@ -15,6 +15,17 @@ pub const TX_FIFO_WORDS: usize = 4;
 pub const RX_FIFO_WORDS: usize = 4;
 /// Most lines (pins) one `OneWire` serves.
 pub const MAX_LINES: usize = 4;
+/// Depth of the RX FIFO in words when it is joined with the unused TX FIFO, as `UartRx` does.
+pub const RX_JOINED_FIFO_WORDS: usize = 8;
+/// The PIO cycle, counted from the one in which the receiver's `wait 0` sees the falling edge, at
+/// which `UartRx` looks at the start bit again. The same offset, plus 16 per bit, is where it
+/// samples every later bit.
+pub const UART_RX_SAMPLE_BASE_CYCLE: u32 = 7;
+/// The PIO cycle, counted the same way, in which the `UartRx` receiver is waiting for the next
+/// start bit again after a good frame (stop-bit sample, push, `wait 1`, then `wait 0`).
+pub const UART_RX_REARM_CYCLE: u32 = 154;
+/// Most pins of the chip: GPIO0 to GPIO47.
+pub const PIN_COUNT: u8 = 48;
 /// The word the program pushes into the RX FIFO when the last stop bit of a write has ended.
 pub const TX_DONE_WORD: u32 = 0xFFFF_FFFF;
 /// The word the program pushes into the RX FIFO when a start bit was gone again at its middle.
@@ -109,6 +120,76 @@ pub const fn rx_drain_window_ns(baud: u32) -> Option<u64> {
     }
     let bits = RX_FIFO_WORDS as u64 * BITS_PER_BYTE as u64;
     Some((bits * 1_000_000_000 + baud as u64 / 2) / baud as u64)
+}
+
+/// The time the CPU has to take received bytes out of the joined RX FIFO of `UartRx` before the
+/// next one is lost, in nanoseconds: `RX_JOINED_FIFO_WORDS` byte times. `None` when `baud` is 0.
+pub const fn uart_rx_drain_window_ns(baud: u32) -> Option<u64> {
+    if baud == 0 {
+        return None;
+    }
+    let bits = RX_JOINED_FIFO_WORDS as u64 * BITS_PER_BYTE as u64;
+    Some((bits * 1_000_000_000 + baud as u64 / 2) / baud as u64)
+}
+
+/// The PIO cycle, counted from the cycle in which the receiver sees the falling edge, at which
+/// `UartRx` looks at bit `bit`: 0 is the start bit (the runt check), 1 to 8 are data bits 0 to 7,
+/// 9 is the stop bit. 16 cycles apart, the first at [`UART_RX_SAMPLE_BASE_CYCLE`].
+pub const fn uart_rx_sample_cycle(bit: u32) -> u32 {
+    CYCLES_PER_BIT * bit + UART_RX_SAMPLE_BASE_CYCLE
+}
+
+/// How far the sender's baud rate may differ from the receiver's, in ppm of the receiver's:
+/// `(low, high)`, `low` negative (slower), `high` positive (faster).
+///
+/// The model: the receiver sees the edge between 0 and 1 cycle late, then samples bit `n` at cycle
+/// [`uart_rx_sample_cycle`]. A sample is right when it lies inside the sender's bit. A sender that
+/// is too slow fails first at the stop bit (earliest possible sample against the start of that
+/// bit); one that is too fast fails first when the next start bit arrives before the receiver is
+/// waiting for it again ([`UART_RX_REARM_CYCLE`]) in back-to-back bytes, or at the stop bit,
+/// whichever is closer. Both limits are rounded towards the middle, so a rate inside them is
+/// inside the model. A rate outside them is not necessarily wrong in practice: this is
+/// arithmetic, the board decides.
+pub const fn uart_rx_tolerance_ppm() -> (i32, i32) {
+    let c = CYCLES_PER_BIT as u64;
+    let mut fast = 1_000_000 * c * 10 / UART_RX_REARM_CYCLE as u64;
+    let mut slow = 0u64;
+    let mut n = 1;
+    while n <= 9 {
+        let sample = uart_rx_sample_cycle(n) as u64;
+        let f = 1_000_000 * c * (n as u64 + 1) / (sample + 1);
+        if f < fast {
+            fast = f;
+        }
+        let s = (1_000_000 * c * n as u64).div_ceil(sample);
+        if s > slow {
+            slow = s;
+        }
+        n += 1;
+    }
+    (slow as i32 - 1_000_000, fast as i32 - 1_000_000)
+}
+
+/// The GPIOBASE (0 or 16) a PIO block must have for a state machine to reach GPIO `pin`, by the
+/// rule embassy-rp 0.10 applies when it writes a state machine's configuration: pins below 32 use
+/// 0, pins 32 to 47 use 16. `None` above GPIO47.
+pub const fn gpiobase_for_pin(pin: u8) -> Option<u8> {
+    if pin < 32 {
+        Some(0)
+    } else if pin < PIN_COUNT {
+        Some(16)
+    } else {
+        None
+    }
+}
+
+/// The value a PIO pin field (in base, JMP pin) holds for GPIO `pin`: the number counted from
+/// [`gpiobase_for_pin`]. `None` above GPIO47.
+pub const fn pin_field(pin: u8) -> Option<u8> {
+    match gpiobase_for_pin(pin) {
+        Some(base) => Some(pin - base),
+        None => None,
+    }
 }
 
 /// PIO clock cycles in `ns` nanoseconds at the given divider, rounded to nearest.
@@ -311,7 +392,86 @@ mod tests {
         assert_eq!((d.integer(), d.fraction()), (0x302, 0x80));
     }
 
+    #[test]
+    fn uart_rx_sample_cycles_are_16_apart_from_7() {
+        assert_eq!(uart_rx_sample_cycle(0), 7);
+        assert_eq!(uart_rx_sample_cycle(1), 23);
+        assert_eq!(uart_rx_sample_cycle(8), 135);
+        assert_eq!(uart_rx_sample_cycle(9), 151);
+        // the stop bit is sampled before the receiver is re-armed
+        assert!(uart_rx_sample_cycle(9) < UART_RX_REARM_CYCLE);
+    }
+
+    #[test]
+    fn uart_rx_tolerance_numbers() {
+        // slow: bit 9 starts at 9 sender bits and is sampled at cycle 151: 144 / 151
+        // fast: the re-arm at cycle 154 against 10 sender bits (160 cycles): 160 / 154
+        assert_eq!(uart_rx_tolerance_ppm(), (-46_357, 38_961));
+    }
+
+    /// An independent model of the tolerance: every sample, with the edge seen 0 to 1 cycle late,
+    /// lies in the sender's bit, and the next start bit comes after the receiver re-arms.
+    fn model_ok(ratio: f64) -> bool {
+        // ratio is the sender baud over the receiver baud; one sender bit lasts 16 / ratio cycles
+        let bit = 16.0 / ratio;
+        for late_q in 0..=8 {
+            let late = late_q as f64 / 8.0;
+            for n in 1..=9u32 {
+                let t = uart_rx_sample_cycle(n) as f64 + late;
+                if t < n as f64 * bit || t > (n + 1) as f64 * bit {
+                    return false;
+                }
+            }
+        }
+        10.0 * bit >= UART_RX_REARM_CYCLE as f64
+    }
+
+    #[test]
+    fn uart_rx_tolerance_matches_the_model_and_covers_3_percent() {
+        let (low, high) = uart_rx_tolerance_ppm();
+        assert!(model_ok(1.0 + low as f64 / 1e6));
+        assert!(model_ok(1.0 + high as f64 / 1e6));
+        assert!(!model_ok(1.0 + (low - 1_000) as f64 / 1e6));
+        assert!(!model_ok(1.0 + (high + 1_000) as f64 / 1e6));
+        for percent in [-3.0, 0.0, 3.0] {
+            assert!(model_ok(1.0 + percent / 100.0), "{percent}");
+        }
+        for percent in [-6.0, 6.0] {
+            assert!(!model_ok(1.0 + percent / 100.0), "{percent}");
+        }
+    }
+
+    #[test]
+    fn uart_rx_drain_window_is_eight_bytes() {
+        assert_eq!(uart_rx_drain_window_ns(115_200), Some(694_444));
+        assert_eq!(uart_rx_drain_window_ns(0), None);
+    }
+
+    #[test]
+    fn gpiobase_and_pin_field_cases() {
+        assert_eq!(gpiobase_for_pin(0), Some(0));
+        assert_eq!(gpiobase_for_pin(31), Some(0));
+        assert_eq!(gpiobase_for_pin(32), Some(16));
+        assert_eq!(gpiobase_for_pin(34), Some(16));
+        assert_eq!(gpiobase_for_pin(47), Some(16));
+        assert_eq!(gpiobase_for_pin(48), None);
+        assert_eq!(pin_field(5), Some(5));
+        assert_eq!(pin_field(31), Some(31));
+        assert_eq!(pin_field(32), Some(16));
+        assert_eq!(pin_field(34), Some(18));
+        assert_eq!(pin_field(47), Some(31));
+        assert_eq!(pin_field(48), None);
+    }
+
     proptest! {
+        #[test]
+        fn pin_field_fits_five_bits_and_adds_up(pin in 0u8..48) {
+            let base = gpiobase_for_pin(pin).unwrap();
+            let field = pin_field(pin).unwrap();
+            prop_assert!(field < 32);
+            prop_assert_eq!(base + field, pin);
+        }
+
         #[test]
         fn divider_error_is_within_half_a_step(clk in 1_000_000u32..400_000_000, baud in 300u32..4_000_000) {
             if let Some(d) = divider(clk, baud) {

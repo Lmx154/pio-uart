@@ -17,6 +17,8 @@ pub const RX_FIFO_WORDS: usize = 4;
 pub const MAX_LINES: usize = 4;
 /// The word the program pushes into the RX FIFO when the last stop bit of a write has ended.
 pub const TX_DONE_WORD: u32 = 0xFFFF_FFFF;
+/// The word the program pushes into the RX FIFO when a start bit was gone again at its middle.
+pub const RUNT_WORD: u32 = 0x7FFF_FFFF;
 
 /// A PIO clock divider in 24.8 fixed point, and how far it is from the wanted baud rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,13 +165,18 @@ pub enum RxWord {
     FramingError,
     /// The last stop bit of a write has ended and the line is released.
     TxDone,
+    /// A low pulse that was already gone at the middle of a start bit: not a start, no byte.
+    Runt,
 }
 
 /// Decodes a word of the RX FIFO: the received frame is in bits 31..23 (stop bit, then data bit 7
-/// down to data bit 0), the other bits are 0; [`TX_DONE_WORD`] is the end-of-write marker.
+/// down to data bit 0), the other bits are 0; [`TX_DONE_WORD`] is the end-of-write marker and
+/// [`RUNT_WORD`] the marker of a runt start.
 pub const fn decode_rx_word(word: u32) -> RxWord {
     if word == TX_DONE_WORD {
         RxWord::TxDone
+    } else if word == RUNT_WORD {
+        RxWord::Runt
     } else if word >> 31 == 0 {
         RxWord::FramingError
     } else {
@@ -290,6 +297,9 @@ mod tests {
         assert_eq!(decode_rx_word(0), RxWord::FramingError);
         assert_eq!(decode_rx_word(0x7F80_0000), RxWord::FramingError);
         assert_eq!(decode_rx_word(TX_DONE_WORD), RxWord::TxDone);
+        assert_eq!(decode_rx_word(RUNT_WORD), RxWord::Runt);
+        // a frame with a low stop bit and data 0xFF is not the runt marker
+        assert_eq!(decode_rx_word(0x7F80_0000), RxWord::FramingError);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! `OneWire`: a half-duplex 8N1 serial line on PIO, on one selected pin of up to four.
 //!
-//! One state machine does everything. Its program (21 instructions) has two halves:
+//! One state machine does everything. Its program (27 instructions) has two halves:
 //!
 //! ```text
 //! tx:    pull block            ; the count word: bytes - 1
@@ -17,20 +17,28 @@
 //!        set pindirs, 0        ; released: the pad pull-up holds the line
 //!        push noblock          ; the end-of-write marker
 //! rx:    wait 0 pin 0          ; start bit (wrap target)
-//!        mov isr, null [20]    ; and on to the middle of data bit 0, 24 cycles after the edge
-//!        set x, 7
+//!        mov isr, null [5]     ; 6 cycles on, the middle of the start bit
+//!        mov x, pins           ; the line at the middle of the start bit
+//!        jmp x-- runt          ; high: a runt, not a start bit
+//!        set x, 7 [13]         ; and on to the middle of data bit 0, 24 cycles after the edge
 //! rxbit: in pins, 1            ; sample
 //!        jmp x-- rxbit [14]
 //!        in pins, 1            ; the stop bit, in the middle of it
 //!        push noblock          ; one word per frame: stop bit, data bit 7 .. 0 in bits 31..23
-//!        wait 1 pin 0          ; wait out a low stop bit
+//! arm:   wait 1 pin 0          ; wait out a low stop bit (wrap top); also the entry after a park
+//! runt:  mov isr, ~null        ; (after the wrap)
+//!        in null, 1            ; 0x7FFF_FFFF, the runt marker
+//!        push noblock
+//!        jmp rx
 //! ```
 //!
 //! The state machine rests in `rx`. A write pushes the message to the TX FIFO and forces a jump to
 //! `tx`; at the end the program itself returns to `rx`: it lets go of the line in the last cycle of
-//! the last stop bit (the line is high, so nothing changes on the wire), pushes the marker at the
-//! first cycle after that bit, and waits for a start bit one cycle later. `wait` looks at the level,
-//! so a reply that has already begun is seen at once. The divider is `clk_sys / (baud * 16)`.
+//! the last stop bit (the line is high, so nothing changes on the wire), pushes the marker in the
+//! first cycle after that bit, and the `wait 0` runs in the next one. `wait` looks at the level, so
+//! a reply that has already begun is seen at once. Anywhere else the receiver is (re)armed at
+//! `arm`, which first waits for the line to be high: after a dropped write, a break, a `select`,
+//! and after a frame. The divider is `clk_sys / (baud * 16)`.
 //!
 //! The pin fields of the state machine are written by `StateMachine::set_config`, which counts
 //! them from GPIOBASE. The program uses `wait pin` and `in pins`, which count from the in base,
@@ -179,6 +187,8 @@ pub struct Stats {
     /// Bytes received but dropped unread: by a write, which starts a new exchange, or by a
     /// `select` or a break.
     pub bytes_discarded: u32,
+    /// Low pulses that were gone again at the middle of a start bit: ignored, no byte.
+    pub runt_starts: u32,
 }
 
 fn bump(counter: &mut u32, by: usize) {
@@ -194,7 +204,7 @@ pub struct OneWire<'d, PIO: Instance, const SM: usize, const N: usize> {
     base: PioConfig<'d, PIO>,
     divider: Divider,
     tx_addr: u8,
-    rx_addr: u8,
+    arm_addr: u8,
     line: usize,
     in_break: bool,
     stats: Stats,
@@ -286,22 +296,30 @@ impl<'d, PIO: Instance + 'd, const SM: usize, const N: usize> OneWire<'d, PIO, S
             ".wrap_target",
             "public rx:",
             "    wait 0 pin 0",
-            "    mov isr, null [20]",
-            "    set x, 7",
+            "    mov isr, null [5]",
+            "    mov x, pins",
+            "    jmp x-- runt",
+            "    set x, 7 [13]",
             "rxbit:",
             "    in pins, 1",
             "    jmp x-- rxbit [14]",
             "    in pins, 1",
             "    push noblock",
+            "public arm:",
             "    wait 1 pin 0",
             ".wrap",
+            "runt:",
+            "    mov isr, ~null",
+            "    in null, 1",
+            "    push noblock",
+            "    jmp rx",
         );
         let loaded = match common.try_load_program(&prg.program) {
             Ok(loaded) => loaded,
             Err(_) => return fail(BuildError::NoSpace, common, sm, pins),
         };
         let tx_addr = loaded.origin.wrapping_add(prg.public_defines.tx as u8) % 32;
-        let rx_addr = loaded.origin.wrapping_add(prg.public_defines.rx as u8) % 32;
+        let arm_addr = loaded.origin.wrapping_add(prg.public_defines.arm as u8) % 32;
         for pin in &mut pins {
             pin.set_pull(Pull::Up);
         }
@@ -323,7 +341,7 @@ impl<'d, PIO: Instance + 'd, const SM: usize, const N: usize> OneWire<'d, PIO, S
             base,
             divider,
             tx_addr,
-            rx_addr,
+            arm_addr,
             line: 0,
             in_break: false,
             stats: Stats::default(),
@@ -337,6 +355,10 @@ impl<'d, PIO: Instance + 'd, const SM: usize, const N: usize> OneWire<'d, PIO, S
     /// its pad pull-up on, and gives the parts back.
     pub fn release(mut self) -> Parts<'d, PIO, SM, N> {
         self.idle_all();
+        self.sm.restart();
+        self.sm.clear_fifos();
+        let _ = self.sm.rx().stalled();
+        let _ = self.sm.tx().stalled();
         let Self {
             mut common,
             sm,
@@ -473,19 +495,21 @@ impl<'d, PIO: Instance + 'd, const SM: usize, const N: usize> OneWire<'d, PIO, S
         self.sm.clear_fifos();
         self.force(set_pindirs(0));
         self.force(set_pins(1));
-        // SAFETY: as in `force`: a jump to the receiver, with the state machine disabled.
-        unsafe { self.sm.exec_jmp(self.rx_addr) };
+        // SAFETY: as in `force`: a jump to the receiver's `arm`, with the state machine disabled.
+        unsafe { self.sm.exec_jmp(self.arm_addr) };
         let _ = self.sm.rx().stalled();
         let _ = self.sm.tx().stalled();
         self.sm.set_enable(true);
     }
 
-    /// Drops what is in the RX FIFO, counting it, and clears the stall flags.
+    /// Drops what is in the RX FIFO, counting it, and clears the stall flags. An overrun found
+    /// here is counted in `stats().overruns` and cleared: the next `read` does not report it.
     fn count_discarded(&mut self) {
         while let Some(word) = self.sm.rx().try_pull() {
             match timing::decode_rx_word(word) {
                 RxWord::Byte(_) => bump(&mut self.stats.bytes_discarded, 1),
                 RxWord::FramingError => bump(&mut self.stats.framing_errors, 1),
+                RxWord::Runt => bump(&mut self.stats.runt_starts, 1),
                 RxWord::TxDone => {}
             }
         }
@@ -529,6 +553,7 @@ impl<'d, PIO: Instance + 'd, const SM: usize, const N: usize> OneWire<'d, PIO, S
                 RxWord::TxDone => break,
                 RxWord::Byte(_) => bump(&mut guard.ow.stats.bytes_discarded, 1),
                 RxWord::FramingError => bump(&mut guard.ow.stats.framing_errors, 1),
+                RxWord::Runt => bump(&mut guard.ow.stats.runt_starts, 1),
             }
         }
         let stalled = guard.ow.sm.tx().stalled();
@@ -565,6 +590,10 @@ impl<'d, PIO: Instance + 'd, const SM: usize, const N: usize> OneWire<'d, PIO, S
                 bump(&mut self.stats.framing_errors, 1);
                 0
             }
+            RxWord::Runt => {
+                bump(&mut self.stats.runt_starts, 1);
+                0
+            }
             RxWord::TxDone => 0,
         }
     }
@@ -579,10 +608,11 @@ impl<'d, PIO: Instance + 'd, const SM: usize, const N: usize> OneWire<'d, PIO, S
         if self.sm.rx().stalled() {
             bump(&mut self.stats.overruns, 1);
             while let Some(word) = self.sm.rx().try_pull() {
-                if timing::decode_rx_word(word) == RxWord::FramingError {
-                    bump(&mut self.stats.framing_errors, 1);
-                } else if matches!(timing::decode_rx_word(word), RxWord::Byte(_)) {
-                    bump(&mut self.stats.bytes_discarded, 1);
+                match timing::decode_rx_word(word) {
+                    RxWord::FramingError => bump(&mut self.stats.framing_errors, 1),
+                    RxWord::Byte(_) => bump(&mut self.stats.bytes_discarded, 1),
+                    RxWord::Runt => bump(&mut self.stats.runt_starts, 1),
+                    RxWord::TxDone => {}
                 }
             }
             return Err(Error::Overrun);
@@ -615,7 +645,14 @@ impl<'d, PIO: Instance + 'd, const SM: usize, const N: usize> embedded_io_async:
 {
     /// Waits for at least one byte and returns every byte that is in the receive FIFO, up to the
     /// length of `buf`. Dropping the future loses nothing. A byte with a low stop bit is counted
-    /// and dropped. An overrun since the last call is returned first, as [`Error::Overrun`].
+    /// and dropped, and so is a runt start (a low pulse gone again at the middle of the start
+    /// bit). An overrun since the last call is returned first, as [`Error::Overrun`], and that
+    /// read empties the FIFO.
+    ///
+    /// Only a `read` reports an overrun. A `write`, `select` or `break_start` first throws away
+    /// everything received and not read and clears the receiver's flags: an overrun or a
+    /// framing error it finds there is counted in [`Stats`] and is NOT reported by the next
+    /// `read`. Read the reply to a request before sending the next one.
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         self.read_impl(buf).await
     }

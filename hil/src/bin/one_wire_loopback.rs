@@ -8,11 +8,16 @@
 //!   transmit code (a `mov pc` into it), because a pad is driven by ONE PIO block, the one its
 //!   function select names, so the peer must be in the block that drives the pad. Its front end
 //!   waits for the first start bit of our message, counts cycles, then jumps into the transmit code:
-//!   the reply starts at a chosen time after our stop bit, with no CPU in the path.
+//!   the reply starts at a chosen time after our stop bit, with no CPU in the path. (The CPU loads
+//!   its x and y with forced instructions, so the front end is 3 instructions.)
 //! - PIO1 state machines 0-3: four receivers, one per pin (the peer's ears, and the check that
 //!   the unselected lines carry nothing). They run the same receive loop as `OneWire`.
 //! - PIO0 state machine 0: the observer. It times the high and low runs of the selected pin to
 //!   one PIO cycle (6.7 ns) and pushes the counts; the CPU rebuilds the waveform from them.
+//!
+//! A low level that no state machine could make (a runt pulse, a line still held low while the
+//! receiver is re-armed) is made with the pad's output override in IO_BANK0, which beats every
+//! PIO latch.
 //!
 //! The pads of one GPIO belong to the PIO block that made them last, so the pins are made in the
 //! order PIO1, PIO0, PIO2: PIO2 drives.
@@ -32,7 +37,7 @@ use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
 use embassy_rp::gpio::{AnyPin, Input, Pull};
 use embassy_rp::peripherals::{PIO0, PIO1, PIO2};
-use embassy_rp::pio::program::{InstructionOperands, SetDestination, pio_asm};
+use embassy_rp::pio::program::{InstructionOperands, OutDestination, SetDestination, pio_asm};
 use embassy_rp::pio::{
     self, Config as PioConfig, FifoJoin, Pin, Pio, ShiftConfig, ShiftDirection, StateMachine,
 };
@@ -105,6 +110,17 @@ impl Rng {
         }
     }
 }
+
+const PULL_BLOCK: u16 = InstructionOperands::PULL {
+    if_empty: false,
+    block: true,
+}
+.encode();
+const OUT_X_32: u16 = InstructionOperands::OUT {
+    destination: OutDestination::X,
+    bit_count: 32,
+}
+.encode();
 
 const fn set(dest: SetDestination, data: u8) -> u16 {
     InstructionOperands::SET {
@@ -181,7 +197,7 @@ async fn mon_collect<const S: usize>(
                 framing += 1;
                 got += 1;
             }
-            RxWord::TxDone => {}
+            RxWord::TxDone | RxWord::Runt => {}
         }
     }
     framing
@@ -291,25 +307,49 @@ impl Peer {
     }
 
     /// The reply `msg` goes out `x + 1 + overhead` cycles after the first start bit of the
-    /// message reaches the front end.
+    /// message reaches the front end. x is loaded by forced `pull` and `out x, 32`, y by a forced
+    /// `set y`, all with the state machine disabled.
     fn arm_delayed(&mut self, line: usize, x: u32, tx_entry: u8, msg: &[u8]) {
         self.quiesce(line);
-        let image = timing::fifo_image(msg).into_iter().flatten();
-        self.load([x, tx_entry as u32].into_iter().chain(image));
+        self.sm.tx().push(x);
+        // SAFETY: the state machine is disabled; the word just pushed goes to x, the transmit
+        // entry (at most 31) to y, and the jump sets the program counter to the front end.
+        unsafe {
+            self.sm.exec_instr(PULL_BLOCK);
+            cortex_m::asm::delay(2_000);
+            self.sm.exec_instr(OUT_X_32);
+            cortex_m::asm::delay(2_000);
+            self.sm.exec_instr(
+                InstructionOperands::SET {
+                    destination: SetDestination::Y,
+                    data: tx_entry,
+                }
+                .encode(),
+            );
+            self.sm.exec_jmp(self.front);
+        }
+        self.load(timing::fifo_image(msg).into_iter().flatten());
         self.push_initial();
-        // SAFETY: the state machine is disabled; the jump sets its program counter to the front end.
-        unsafe { self.sm.exec_jmp(self.front) };
+        self.sm.set_enable(true);
+    }
+
+    /// Loads `msg` for an immediate send into the transmit code; `go` starts it.
+    fn prepare_now(&mut self, line: usize, tx_entry: u8, msg: &[u8]) {
+        self.quiesce(line);
+        self.load(timing::fifo_image(msg).into_iter().flatten());
+        self.push_initial();
+        // SAFETY: the state machine is disabled; the jump sets its program counter.
+        unsafe { self.sm.exec_jmp(tx_entry) };
+    }
+
+    fn go(&mut self) {
         self.sm.set_enable(true);
     }
 
     /// Sends `msg` at once, straight into the transmit code.
     fn arm_now(&mut self, line: usize, tx_entry: u8, msg: &[u8]) {
-        self.quiesce(line);
-        self.load(timing::fifo_image(msg).into_iter().flatten());
-        self.push_initial();
-        // SAFETY: as in `arm_delayed`, to the transmit entry.
-        unsafe { self.sm.exec_jmp(tx_entry) };
-        self.sm.set_enable(true);
+        self.prepare_now(line, tx_entry, msg);
+        self.go();
     }
 
     /// Drives the line low push-pull, until `release_low`.
@@ -547,6 +587,35 @@ fn pad_levels() -> u8 {
 
 fn oe_bits() -> u8 {
     ((pac::PIO2.dbg_padoe().read() & OE_MASK) >> OE_SHIFT) as u8
+}
+
+/// Forces the pad of `line` low (output enabled, level low) whatever the PIO latches say, or
+/// gives it back to its function.
+fn force_low(line: usize, on: bool) {
+    pac::IO_BANK0.gpio(FIRST_GPIO + line).ctrl().modify(|w| {
+        if on {
+            w.set_oeover(pac::io::vals::Oeover::ENABLE);
+            w.set_outover(pac::io::vals::Outover::LOW);
+        } else {
+            w.set_oeover(pac::io::vals::Oeover::NORMAL);
+            w.set_outover(pac::io::vals::Outover::NORMAL);
+        }
+    });
+}
+
+/// Waits `cycles` CPU cycles by the cycle counter (`asm::delay` takes about 2.7 cycles a count).
+fn spin(cycles: u32) {
+    let t0 = DWT::cycle_count();
+    while DWT::cycle_count().wrapping_sub(t0) < cycles {}
+}
+
+/// A low pulse of about `cycles` CPU cycles on `line`, interrupts off.
+fn low_pulse(line: usize, cycles: u32) {
+    cortex_m::interrupt::free(|_| {
+        force_low(line, true);
+        spin(cycles);
+        force_low(line, false);
+    });
 }
 
 fn pullups() -> u8 {
@@ -839,10 +908,6 @@ async fn main(_spawner: Spawner) {
     // Peer front end, loaded before OneWire so that OneWire takes what is left.
     let peer_prg = pio_asm!(
         "front:",
-        "    pull block",
-        "    out x, 32",
-        "    pull block",
-        "    out y, 32",
         "    wait 0 pin 0",
         "dl:",
         "    jmp x-- dl",
@@ -878,7 +943,7 @@ async fn main(_spawner: Spawner) {
         }
     };
     defmt::info!(
-        "[INFO] PIO2: peer front end {=u8} instructions at {=u8}, OneWire program at {=u8} (tx entry); {=u8} + 21 of 32 slots",
+        "[INFO] PIO2: peer front end {=u8} instructions at {=u8}, OneWire program at {=u8} (tx entry); {=u8} + 27 of 32 slots",
         peer_prg.program.code.len() as u8,
         peer_loaded.origin,
         ow.tx_entry(),
@@ -1429,7 +1494,7 @@ async fn main(_spawner: Spawner) {
             embassy_futures::join::join(
                 ow.write(&tx[..100]),
                 // 20 ms with the CPU busy: more than the FIFO and the output register last
-                async { cortex_m::asm::delay(3_000_000) },
+                async { spin(3_000_000) },
             ),
         )
         .await;
@@ -1456,6 +1521,181 @@ async fn main(_spawner: Spawner) {
             e.is_ok(),
             "[{=str}] extra: an echo of 21 bytes passes after the underrun"
         );
+    }
+
+    // ---- Check 10: runt starts are not bytes ----
+    {
+        let line = 1usize;
+        let _ = ow.select(line);
+        for (name, cycles) in [("a quarter bit", 1953u32), ("a third of a bit", 2604)] {
+            // the width the pad really had, seen by the observer
+            let done = Cell::new(false);
+            rig.obs.start(line);
+            let (_, cnt) = embassy_futures::join::join(
+                async {
+                    Timer::after_micros(200).await;
+                    low_pulse(line, cycles);
+                    done.set(true);
+                },
+                rig.obs.drain(&mut words, &done),
+            )
+            .await;
+            rig.obs.stop();
+            let e = Edges::from_words(&words[..cnt]);
+            let width = if e.n >= 2 {
+                ns_of_q(e.t[1] - e.t[0])
+            } else {
+                -1
+            };
+            let nominal = cycles as i64 * 20 / 3;
+            defmt::info!(
+                "[STAT] runt pulse of {=str}: asked {=u32} CPU cycles ({=i64} ns), the pad was low {=i64} ns, the receiver's check is at 8 PIO cycles = 26040 ns",
+                name,
+                cycles,
+                nominal,
+                width
+            );
+            check!(
+                fails,
+                width >= nominal - 500 && width <= nominal + 2000,
+                "[{=str}] check 10: the runt pulse of {=str} lasts {=i64} ns on the pad",
+                name,
+                width
+            );
+            let _ = ow.select(line);
+            // 20 runts alone: no byte, no framing error, the runt counter moves by one each
+            let mut bad = 0u32;
+            let mut buf = [0u8; 4];
+            for _ in 0..20 {
+                let s0 = ow.stats();
+                low_pulse(line, cycles);
+                let r = with_timeout(Duration::from_millis(3), ow.read(&mut buf)).await;
+                let s1 = ow.stats();
+                if r.is_ok()
+                    || s1.runt_starts != s0.runt_starts + 1
+                    || s1.bytes_received != s0.bytes_received
+                    || s1.framing_errors != s0.framing_errors
+                {
+                    bad += 1;
+                }
+            }
+            check!(
+                fails,
+                bad == 0,
+                "[{=str}] check 10: 20 runt pulses of {=str}: no byte, no framing error, runt counter +1 each ({=u32} wrong)",
+                name,
+                bad
+            );
+            // 20 runts each followed at once by a real byte: the byte arrives alone
+            let mut bad = 0u32;
+            for _ in 0..20 {
+                let byte = [(rig.rng.next() >> 9) as u8];
+                let s0 = ow.stats();
+                rig.peer.prepare_now(line, ow.tx_entry(), &byte);
+                cortex_m::interrupt::free(|_| {
+                    force_low(line, true);
+                    spin(cycles);
+                    force_low(line, false);
+                    rig.peer.go();
+                });
+                let r = with_timeout(Duration::from_millis(20), ow.read(&mut buf)).await;
+                rig.peer.stop();
+                let s1 = ow.stats();
+                if !matches!(r, Ok(Ok(1)))
+                    || buf[0] != byte[0]
+                    || s1.runt_starts != s0.runt_starts + 1
+                    || s1.framing_errors != s0.framing_errors
+                {
+                    bad += 1;
+                }
+                let _ = with_timeout(Duration::from_millis(1), ow.read(&mut buf)).await;
+            }
+            check!(
+                fails,
+                bad == 0,
+                "[{=str}] check 10: 20 runt pulses of {=str}, each followed at once by a real byte: the byte arrives alone ({=u32} wrong)",
+                name,
+                bad
+            );
+        }
+        ow.select(0).unwrap();
+    }
+
+    // ---- Check 11: an armed receiver waits for the line to be high before it looks for a start ----
+    {
+        let line = 1usize;
+        let _ = ow.select(line);
+        let mut buf = [0u8; 4];
+        // after break_end, with the line held low for 100 us more (a slow rise)
+        let s0 = ow.stats();
+        let _ = ow.break_start();
+        Timer::after_millis(1).await;
+        force_low(line, true);
+        ow.break_end();
+        spin(15_000);
+        force_low(line, false);
+        let r = with_timeout(Duration::from_millis(3), ow.read(&mut buf)).await;
+        let s1 = ow.stats();
+        check!(
+            fails,
+            r.is_err()
+                && s1.bytes_received == s0.bytes_received
+                && s1.framing_errors == s0.framing_errors
+                && s1.runt_starts == s0.runt_starts,
+            "[{=str}] check 11: read first after break_end with the line low 100 us longer: nothing arrives (bytes {=u32}, framing {=u32}, runts {=u32} -> {=u32}, {=u32}, {=u32})",
+            s0.bytes_received,
+            s0.framing_errors,
+            s0.runt_starts,
+            s1.bytes_received,
+            s1.framing_errors,
+            s1.runt_starts
+        );
+        rig.rng.fill(&mut tx[..21]);
+        rig.rng.fill(&mut rx[..21]);
+        let e = rig.exchange(&mut ow, line, &tx[..21], &rx[..21], 8).await;
+        check!(
+            fails,
+            e.is_ok(),
+            "[{=str}] check 11: an echo of 21 bytes passes after it"
+        );
+        // after a write dropped while the line is low, 20 different cut points
+        let data = [0u8; 100];
+        let mut bad = 0u32;
+        for k in 0..20u64 {
+            let s0 = ow.stats();
+            let cut = embassy_futures::select::select(ow.write(&data), async {
+                Timer::after_micros(3000 + 41 * k).await;
+                force_low(line, true);
+            })
+            .await;
+            spin(15_000);
+            force_low(line, false);
+            let r = with_timeout(Duration::from_millis(3), ow.read(&mut buf)).await;
+            let s1 = ow.stats();
+            if !matches!(cut, Either::Second(()))
+                || r.is_ok()
+                || s1.bytes_received != s0.bytes_received
+                || s1.framing_errors != s0.framing_errors
+                || s1.runt_starts != s0.runt_starts
+            {
+                bad += 1;
+            }
+        }
+        check!(
+            fails,
+            bad == 0,
+            "[{=str}] check 11: read first after a write dropped with the line low, 20 cut points: nothing arrives ({=u32} wrong)",
+            bad
+        );
+        rig.rng.fill(&mut tx[..21]);
+        rig.rng.fill(&mut rx[..21]);
+        let e = rig.exchange(&mut ow, line, &tx[..21], &rx[..21], 8).await;
+        check!(
+            fails,
+            e.is_ok(),
+            "[{=str}] check 11: an echo of 21 bytes passes after them"
+        );
+        ow.select(0).unwrap();
     }
 
     // ---- Check 9: release and build again, 100 times ----

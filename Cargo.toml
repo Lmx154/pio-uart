@@ -1,0 +1,23 @@
+[package]
+name = "pio-uart"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Byte transports on PIO for the RP2350. A hardware-independent core of divider and timing arithmetic, and OneWire: a half-duplex 8N1 serial line on one of up to four consecutive pins, for embassy-rp."
+
+[features]
+defmt = ["dep:defmt", "embassy-rp?/defmt"]
+# OneWire for embassy-rp 0.10 with embedded-io-async 0.7. The chip feature (rp235xa/rp235xb) comes from the application.
+embassy-rp-0-10 = ["dep:embassy-rp", "dep:embedded-io-async", "dep:fixed"]
+# Extra entry points that only the on-target test uses.
+_test-hooks = ["embassy-rp-0-10"]
+
+[dependencies]
+defmt = { version = "1.0.1", optional = true }
+embassy-rp = { version = "0.10.0", default-features = false, optional = true }
+embedded-io-async = { version = "0.7", optional = true }
+fixed = { version = "1.31", optional = true }
+
+[dev-dependencies]
+proptest = "1.12"

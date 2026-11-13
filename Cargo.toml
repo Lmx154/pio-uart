@@ -5,6 +5,11 @@ edition = "2024"
 publish = false
 license = "MIT"
 description = "Byte transports on PIO for the RP2350. A hardware-independent core of divider and timing arithmetic, and OneWire: a half-duplex 8N1 serial line on one of up to four consecutive pins, for embassy-rp."
+repository = "https://github.com/Lmx154/pio-uart"
+readme = "README.md"
+keywords = ["embedded", "no-std", "pio", "uart", "rp2350"]
+categories = ["embedded", "no-std", "hardware-support"]
+rust-version = "1.99"
 
 [features]
 defmt = ["dep:defmt", "embassy-rp?/defmt"]

@@ -4,6 +4,10 @@ Byte transports on PIO for the RP2350, `no_std`. They carry bytes and know no pr
 
 Status: version 0.1.0, `publish = false`, and the API may still change. `OneWire` has been tested on a MARV V2 Rev 1 board in loop-back on spare pins against a test peer written for the purpose (2026-11-12, see "Measured on the MARV V2 Rev 1 board"). `UartRx` has been tested on the same board in loop-back on GPIO34 against a sender written for the test (2026-11-12, see the same section). Neither has been run against any real device; no real ESC telemetry has been received.
 
+## Works with
+
+The timing arithmetic is pure and works on any target. `OneWire` and `UartRx` need the RP2040/RP2350 PIO and are written for `embassy-rp` 0.10, behind the `embassy-rp-0-10` feature; they need no embassy executor and no `embassy-time`. No back-end for `rp2040-hal` or `rp235x-hal` exists; the core and the transport traits are the place to add one.
+
 ## Quick start
 
 The arithmetic (compiled by `cargo test`):
